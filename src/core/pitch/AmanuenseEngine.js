@@ -17,10 +17,11 @@ export class AmanuenseEngine {
     this.quantizeBeats = 0.5 // 1 = negra, 0.5 = corchea, 0.25 = semicorchea
     this.octaveOffset = 0    // +12 para guitarra (se escribe una octava arriba)
 
-    // Estado interno de segmentación (estabilidad de nota vs silencio)
+    // Estado interno de segmentación
     this.hasStartedFirstNote = false
     this.activeMidi = null // null = silencio
     this.segmentStartTime = 0
+    this.lastValidPitchTime = 0
     this.candidateMidi = undefined
     this.candidateFrames = 0
 
@@ -48,17 +49,16 @@ export class AmanuenseEngine {
     this.hasStartedFirstNote = false
     this.activeMidi = null
     this.segmentStartTime = 0
+    this.lastValidPitchTime = 0
     this.candidateMidi = undefined
     this.candidateFrames = 0
 
-    // 1. Encender micrófono primero para validar permisos antes de la cuenta
     await this.pitchDetector.start((pitch) => {
       if (this.onPitchLive) this.onPitchLive(pitch)
       if (!this.isRecording || this.inCountIn) return
       this.processPitchFrame(pitch)
     })
 
-    // 2. Arrancar metrónomo con 1 compás de cuenta regresiva
     this.isRecording = true
     this.inCountIn = options.countIn !== false
     this.countInBeatsLeft = this.inCountIn ? this.numerator : 0
@@ -74,12 +74,12 @@ export class AmanuenseEngine {
         this.countInBeatsLeft--
 
         if (this.countInBeatsLeft <= 0) {
-          // Termina la cuenta al completar el último pulso del compás de preparación
           const beatMs = (60 / this.bpm) * (4 / this.denominator) * 1000
           setTimeout(() => {
             if (!this.isRecording) return
             this.inCountIn = false
             this.segmentStartTime = performance.now()
+            this.lastValidPitchTime = this.segmentStartTime
             if (this.onCountIn) this.onCountIn(0, this.numerator)
           }, Math.max(50, beatMs - 40))
         }
@@ -92,16 +92,39 @@ export class AmanuenseEngine {
 
   processPitchFrame(pitch) {
     const now = performance.now()
-    const detectedMidi = pitch ? pitch.midiNote + this.octaveOffset : null
+    let detectedMidi = pitch ? pitch.midiNote + this.octaveOffset : null
 
-    // Si seguimos en la misma nota (o silencio), reiniciamos el candidato
+    if (detectedMidi !== null) {
+      this.lastValidPitchTime = now
+    }
+
+    // Si estamos sosteniendo una nota y hay un hueco de pitch < 130 ms (muy común en guitarra),
+    // mantenemos la nota activa para evitar silencios falsos
+    if (detectedMidi === null && this.activeMidi !== null) {
+      const gapMs = now - this.lastValidPitchTime
+      if (gapMs < 130) {
+        this.candidateMidi = undefined
+        this.candidateFrames = 0
+        return
+      }
+    }
+
+    // Si estamos dentro de la misma nota (o tolerancia de ±1 semitono en guitarra para evitar vibrato/armónico),
+    // consolidamos sobre la nota activa
+    if (
+      detectedMidi !== null &&
+      this.activeMidi !== null &&
+      Math.abs(detectedMidi - this.activeMidi) <= 1
+    ) {
+      detectedMidi = this.activeMidi
+    }
+
     if (detectedMidi === this.activeMidi) {
       this.candidateMidi = undefined
       this.candidateFrames = 0
       return
     }
 
-    // Estabilidad: exigir 3 cuadros seguidos para cambiar de nota (4 para cortar a silencio)
     if (detectedMidi === this.candidateMidi) {
       this.candidateFrames++
     } else {
@@ -109,12 +132,14 @@ export class AmanuenseEngine {
       this.candidateFrames = 1
     }
 
-    const requiredFrames = detectedMidi === null ? 4 : 3
+    // Exigimos más frames para cambiar a una nota nueva (5) o a silencio (6) y evitar notas fantasma
+    const requiredFrames = detectedMidi === null ? 6 : 5
     if (this.candidateFrames < requiredFrames) return
 
-    // Confirmado cambio real de estado: cerrar y cuantizar el segmento anterior
-    if (this.hasStartedFirstNote && this.segmentStartTime > 0) {
-      this.commitSegment(this.activeMidi, now - this.segmentStartTime)
+    // Evitar segmentos de menos de 90 ms (ataques/ruidos breves)
+    const elapsedMs = now - this.segmentStartTime
+    if (this.hasStartedFirstNote && this.segmentStartTime > 0 && elapsedMs >= 90) {
+      this.commitSegment(this.activeMidi, elapsedMs)
     }
 
     if (detectedMidi !== null) {
@@ -131,15 +156,17 @@ export class AmanuenseEngine {
     const secondsPerQuarter = 60 / this.bpm
     const rawBeats = (durationMs / 1000) / secondsPerQuarter
     const q = this.quantizeBeats
+
+    // Cuantización conservadora: evita inflar notas cortas a figuras largas
     let quantizedBeats = Math.round(rawBeats / q) * q
 
-    // Evitar perder notas muy breves reales si superan el 40% de la rejilla
-    if (quantizedBeats === 0 && midi !== null && rawBeats >= q * 0.4) {
+    if (quantizedBeats === 0 && midi !== null && rawBeats >= q * 0.55) {
       quantizedBeats = q
     }
 
-    // Ignorar silencios demasiado cortos (respiraciones o micro-cortes entre notas)
-    if (quantizedBeats < q) return
+    // Solo insertamos silencios intencionales de al menos 1 pulso/rejilla completa
+    if (midi === null && quantizedBeats < Math.max(q, 1)) return
+    if (midi !== null && quantizedBeats < q) return
 
     if (this.onChunkCommitted) {
       this.onChunkCommitted({
@@ -151,8 +178,17 @@ export class AmanuenseEngine {
   }
 
   stop(commitLast = true) {
-    if (commitLast && this.isRecording && !this.inCountIn && this.hasStartedFirstNote && this.activeMidi !== null) {
-      this.commitSegment(this.activeMidi, performance.now() - this.segmentStartTime)
+    if (
+      commitLast &&
+      this.isRecording &&
+      !this.inCountIn &&
+      this.hasStartedFirstNote &&
+      this.activeMidi !== null
+    ) {
+      const elapsedMs = performance.now() - this.segmentStartTime
+      if (elapsedMs >= 90) {
+        this.commitSegment(this.activeMidi, elapsedMs)
+      }
     }
 
     this.isRecording = false

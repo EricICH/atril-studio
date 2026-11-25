@@ -224,7 +224,7 @@ onUnmounted(() => {
               class="px-3 py-1.5 rounded-lg text-xs font-semibold transition-colors cursor-pointer"
               :class="!gameMode ? 'bg-indigo-600 text-white' : 'text-slate-400 hover:text-slate-200'"
             >
-              Modo Karaoke
+              Reproducir
             </button>
             <button
               @click="gameMode = true"
@@ -232,7 +232,7 @@ onUnmounted(() => {
               :class="gameMode ? 'bg-emerald-600 text-white' : 'text-slate-400 hover:text-slate-200'"
             >
               <Gamepad2 class="w-3.5 h-3.5" />
-              <span>Modo Juego</span>
+              <span>Modo Estudio</span>
             </button>
           </div>
 
